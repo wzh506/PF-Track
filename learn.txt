@@ -1,0 +1,7 @@
+1.首先训练 Single-frame，其实就是obejectdetection model
+bash tools/dist_train.sh projects/configs/tracking/petr/f1_q5_800x320.py 2 --work-dir work_dirs/f1_pf_track/ 
+2.然后训练 Multi-frame，其实就是obejectdetection
+bash tools/dist_train.sh projects/configs/tracking/petr/f3_q5_800x320.py 2 --work-dir work_dirs/f3_pf_track/ 
+3.进行inference
+python tools/test_tracking.py projects/configs/tracking/petr/f3_q500_800x320.py ./work_dir/f3_petr_800x320/final.pth --jsonfile_prefix ./work_dir/f3_petr_800x320/results --eval bbox
+python tools/test_tracking.py projects/configs/tracking/petr/f3_q500_800x320.py ckpt/f3_all/final.pth --jsonfile_prefix ckpt/f3_all/track_no_ext --eval bbox
