@@ -12,7 +12,45 @@ from projects.mmdet3d_plugin.models.dense_heads.petr_head import pos2posemb3d
 from mmdet.models.utils.transformer import inverse_sigmoid
 from mmdet.models.utils import build_transformer
 from .utils import time_position_embedding, xyz_ego_transformation, normalize, denormalize
+from mmdet.models.utils.builder import TRANSFORMER
+from mmcv.runner.base_module import BaseModule
 
+@TRANSFORMER.register_module()
+class BoxDecoder(BaseModule):
+    def __init__(self,
+                 num_classes=10,
+                 embed_dims=256,
+                 hidden_dim=256,
+                 init_cfg=None,
+                 **kwargs
+                 ):
+        super(BoxDecoder, self).__init__(init_cfg)
+        
+        self.num_classes = num_classes
+        self.embed_dims = embed_dims
+        self.hidden_dim = hidden_dim
+        
+        self.input1_proj = nn.Linear(num_classes, hidden_dim)
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        
+        # Second input: [500+Y, 256]
+        # Attention layer for combining features
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        
+        # Output projection
+        self.output_proj = nn.Linear(hidden_dim, hidden_dim)
+    def forward(self, bbox,feat):
+        input1 = self.input1_proj(bbox)  # [N, 256]
+        input1 = input1.transpose(1, 0).unsqueeze(0)  # [1, 256, N]
+        input1 = self.global_pool(input1).squeeze(-1)  # [1, 256]
+        
+        input1 = input1.expand(feat.size(0), -1).unsqueeze(0)  # [1, 500+Y, 256]
+        
+        attn_output, _ = self.attention(feat.unsqueeze(0), input1, input1)  # [1, 500+Y, 256]
+        
+        output = self.output_proj(attn_output).squeeze(0)  # [500+Y, 256]
+        return output
+        
 
 class SpatialTemporalReasoner(nn.Module):
     def __init__(self, 
@@ -87,7 +125,7 @@ class SpatialTemporalReasoner(nn.Module):
         ts_pe = time_position_embedding(hist_embed.shape[0], self.hist_len, 
                                         self.embed_dims, hist_embed.device)
         ts_pe = self.ts_query_embed(ts_pe)
-        temporal_embed = self.hist_temporal_transformer(
+        temporal_embed = self.hist_temporal_transformer( #对应cross frame attn
             target=embed[:, None, :], 
             x=hist_embed, 
             query_embed=ts_pe[:, -1:, :],
@@ -120,7 +158,7 @@ class SpatialTemporalReasoner(nn.Module):
             return track_instances
         
         """Classification"""
-        logits = self.track_cls(track_instances.cache_query_feats[valid_idxes])
+        logits = self.track_cls(track_instances.cache_query_feats[valid_idxes])#torch.Size([532, 256])，就上一帧的结果
         # track_instances.hist_logits[valid_idxes, -1, :] = logits.clone()
         track_instances.cache_logits[valid_idxes] = logits.clone()
         track_instances.cache_scores = logits.sigmoid().max(dim=-1).values
@@ -136,7 +174,7 @@ class SpatialTemporalReasoner(nn.Module):
         deltas[..., [0, 1, 4]] = denormalize(deltas[..., [0, 1, 4]], self.pc_range)
         track_instances.cache_bboxes[valid_idxes, :] = deltas
         # track_instances.hist_bboxes[valid_idxes, -1, :] = deltas.clone()
-        return track_instances
+        return track_instances #这里主要是将bbox refine
 
     def forward_future_reasoning(self, track_instances: Instances):
         hist_embeds = track_instances.hist_embeds
@@ -144,18 +182,18 @@ class SpatialTemporalReasoner(nn.Module):
         ts_pe = time_position_embedding(hist_embeds.shape[0], self.hist_len + self.fut_len, 
                                         self.embed_dims, hist_embeds.device)
         ts_pe = self.ts_query_embed(ts_pe)
-        fut_embeds = self.fut_temporal_transformer(
-            target=torch.zeros_like(ts_pe[:, self.hist_len:, :]),
-            x=hist_embeds,
+        fut_embeds = self.fut_temporal_transformer(#torch.Size([532, 8, 256]) m=MLP(fut_embeds)
+            target=torch.zeros_like(ts_pe[:, self.hist_len:, :]), #这个是作为query
+            x=hist_embeds,#这个是作为key和value
             query_embed=ts_pe[:, self.hist_len:],
             pos_embed=ts_pe[:, :self.hist_len],
             key_padding_mask=hist_padding_masks)
-        track_instances.fut_embeds = fut_embeds
+        track_instances.fut_embeds = fut_embeds #这东西训练的时候怎么监督的???拿t后的gt来监督
         return track_instances
     
     def forward_future_prediction(self, track_instances):
         """Predict the future motions"""
-        motion_predictions = self.future_reg(track_instances.fut_embeds)
+        motion_predictions = self.future_reg(track_instances.fut_embeds)#torch.Size([532, 8, 3])#直接相加位置
         track_instances.cache_motion_predictions = motion_predictions
         return track_instances
 
@@ -287,7 +325,7 @@ class SpatialTemporalReasoner(nn.Module):
         # embeds
         track_instances.hist_embeds = track_instances.hist_embeds.clone()
         track_instances.hist_embeds = torch.cat((
-            track_instances.hist_embeds[:, 1:, :], track_instances.cache_query_feats[:, None, :]), dim=1)
+            track_instances.hist_embeds[:, 1:, :], track_instances.cache_query_feats[:, None, :]), dim=1)#居然是过去的query
         # padding masks
         track_instances.hist_padding_masks = torch.cat((
             track_instances.hist_padding_masks[:, 1:], 

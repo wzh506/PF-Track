@@ -158,6 +158,10 @@ model = dict(
         score_threshold=0.4,
         record_threshold=0.4,
         max_age_since_update=6,),
+    bbox_query=dict(
+        num_classes=10,
+        embed_dims=256,
+    ),
     spatial_temporal_reason=dict(
         history_reasoning=True,
         future_reasoning=True,

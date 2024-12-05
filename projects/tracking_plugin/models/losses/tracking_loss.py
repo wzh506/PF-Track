@@ -29,7 +29,7 @@ class TrackingLoss(TrackingLossBase):
                           gt_bboxes_list,
                           gt_labels_list,
                           instance_ids,
-                          preds_dicts,
+                          preds_dicts,#对应的就是out，目标检测的结果
                           gt_bboxes_ignore):
         """Match according to both tracking and detection information
            Generate the single frame loss function, modify the ids of track instances
@@ -51,39 +51,39 @@ class TrackingLoss(TrackingLossBase):
             (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
             dim=1).to(device) for gt_bboxes in gt_bboxes_list]
         
-        obj_idxes_list = instance_ids[0].detach().cpu().numpy().tolist()
+        obj_idxes_list = instance_ids[0].detach().cpu().numpy().tolist()#这是gt,d都是大数字
         obj_idx_to_gt_idx = {obj_idx: gt_idx for gt_idx, obj_idx in enumerate(obj_idxes_list)}
 
-        num_disappear_track = 0
+        num_disappear_track = 0 #下面和mutr3d的简直一模一样
         # step 1. Inherit and Update the previous tracks
         for trk_idx in range(len(track_instances)):
-            obj_id = track_instances.obj_idxes[trk_idx].item()
-            if obj_id >= 0:
+            obj_id = track_instances.obj_idxes[trk_idx].item()#查看第一个query目前对应的id
+            if obj_id >= 0:#说明应该有对应的gt
                 if obj_id in obj_idx_to_gt_idx:
-                    track_instances.matched_gt_idxes[trk_idx] = obj_idx_to_gt_idx[obj_id]
+                    track_instances.matched_gt_idxes[trk_idx] = obj_idx_to_gt_idx[obj_id]#第trk_idx对应上了gt中第obj_id的目标
                 else:
-                    num_disappear_track += 1
-                    track_instances.matched_gt_idxes[trk_idx] = -2
+                    num_disappear_track += 1 #这个目标在gt中没有匹配的，所以检测错误，本来应该检测不出来的，gt消失了
+                    track_instances.matched_gt_idxes[trk_idx] = -2 #不存在
             else:
-                track_instances.matched_gt_idxes[trk_idx] = -1
+                track_instances.matched_gt_idxes[trk_idx] = -1 #检测失败，消失了
         
         full_track_idxes = torch.arange(len(track_instances), dtype=torch.long).to(all_cls_scores.device)
         # previsouly tracked, which is matched by rule
-        all_matched_track_idxes = full_track_idxes[track_instances.obj_idxes >= 0]
+        all_matched_track_idxes = full_track_idxes[track_instances.obj_idxes >= 0]#哪些有
         matched_track_idxes = full_track_idxes[track_instances.matched_gt_idxes >= 0]
         
         # step2. select the unmatched slots.
         # note that the FP tracks whose obj_idxes are -2 will not be selected here.
-        unmatched_track_idxes = full_track_idxes[track_instances.obj_idxes == -1]
+        unmatched_track_idxes = full_track_idxes[track_instances.obj_idxes == -1] #检测出来有物体，但实际上没有gt存在
 
         # step3. select the untracked gt instances (new tracks).
         tgt_indexes = track_instances.matched_gt_idxes.clone()
-        tgt_indexes = tgt_indexes[tgt_indexes >= 0]
+        tgt_indexes = tgt_indexes[tgt_indexes >= 0]#这是匹配成功的把
         tgt_state = torch.zeros(len(gt_bboxes_list[0])).to(all_cls_scores.device)
-        tgt_state[tgt_indexes] = 1
+        tgt_state[tgt_indexes] = 1 #这些是保持跟踪的
         # new tgt indexes
         untracked_tgt_indexes = torch.arange(len(gt_bboxes_list[0])).to(all_cls_scores.device)[tgt_state == 0]
-
+        # 这些是没有被检测到的gt，可能是检测错误，总之没有对应的检测框id
         all_unmatched_gt_bboxes_list = [[gt_bboxes_list[0][untracked_tgt_indexes]] for _ in range(num_dec_layers)]
         all_unmatched_gt_labels_list = [[gt_labels_list[0][untracked_tgt_indexes]] for _ in range(num_dec_layers)]
         all_unmatched_gt_ids_list = [[instance_ids[0][untracked_tgt_indexes]] for _ in range(num_dec_layers)]
@@ -92,11 +92,11 @@ class TrackingLoss(TrackingLossBase):
         unmatched_cls_scores = all_cls_scores[:, :, unmatched_track_idxes, :]
         unmatched_bbox_preds = all_bbox_preds[:, :, unmatched_track_idxes, :]
 
-        # step4. do matching between the unmatched slots and GTs.
+        # step4. do matching between the unmatched slots and GTs.#保证了gt和检测结果的匹配
         unmatched_track_matching_result = list()
         for dec_layer_idx in range(num_dec_layers):
             unmatched_track_dec_matching_result = self.get_targets(
-                unmatched_cls_scores[dec_layer_idx],
+                unmatched_cls_scores[dec_layer_idx], #只有没有匹配上的检测结果
                 unmatched_bbox_preds[dec_layer_idx],
                 all_unmatched_gt_bboxes_list[dec_layer_idx],
                 all_unmatched_gt_labels_list[dec_layer_idx],

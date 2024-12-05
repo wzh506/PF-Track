@@ -34,6 +34,7 @@ from mmseg import __version__ as mmseg_version
 from mmdet.utils import get_device
 
 def parse_args():
+    # torch.autograd.set_detect_anomaly(True) #后面记住关了 这东西开着严重影响速度
     parser = argparse.ArgumentParser(description='Train a detector')
     parser.add_argument('config', help='train config file path')
     parser.add_argument('--work-dir', help='the dir to save logs and models')

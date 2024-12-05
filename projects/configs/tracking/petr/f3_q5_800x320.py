@@ -158,6 +158,12 @@ model = dict(
         score_threshold=0.4,
         record_threshold=0.4,
         max_age_since_update=7,),
+    bbox_query=dict(
+        type = 'BboxDecoder',
+        num_classes=10,
+        embed_dims=256,
+        hidden_dim=256,
+    ),
     spatial_temporal_reason=dict( # past and future reasoning
         history_reasoning=True, # use past reasoning
         future_reasoning=True,  # use future reasoning

@@ -198,7 +198,7 @@ class TrackingLossBase(nn.Module):
         gt_bboxes_ignore_list = [
             gt_bboxes_ignore_list for _ in range(num_imgs)
         ]
-
+        # 总之这里是相当稀疏的，会给每个object分配label和instance_id
         (labels_list, label_instance_ids_list, label_weights_list, bbox_targets_list,
          bbox_weights_list, pos_inds_list, neg_inds_list, gt_match_idxes_list) = multi_apply(
              self._get_target_single, cls_scores_list, bbox_preds_list,

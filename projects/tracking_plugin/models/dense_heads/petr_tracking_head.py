@@ -294,7 +294,7 @@ class PETRCamTrackingHead(AnchorFreeHead):
                 head with normalized coordinate format (cx, cy, w, l, cz, h, theta, vx, vy). \
                 Shape [nb_dec, bs, num_query, 9].
         """
-        
+        #把握一下输入输出的维度
         x = mlvl_feats[0]
         batch_size, num_cams = x.size(0), x.size(1)
         input_img_h, input_img_w, _ = img_metas[0]['pad_shape'][0]
@@ -354,39 +354,42 @@ class PETRCamTrackingHead(AnchorFreeHead):
         for lvl in range(outs_dec.shape[0]):
             reference = inverse_sigmoid(reference_points.clone())
             assert reference.shape[-1] == 3
-            outputs_class = self.cls_branches[lvl](outs_dec[lvl])
-            tmp = self.reg_branches[lvl](outs_dec[lvl])
+            outputs_class = self.cls_branches[lvl](outs_dec[lvl])#torch.Size([1, 533, 256]) -> torch.Size([1, 533, 10])
+            tmp = self.reg_branches[lvl](outs_dec[lvl])#
 
-            tmp[..., 0:2] += reference[..., 0:2]
-            tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
-            tmp[..., 4:5] += reference[..., 2:3]
-            tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
+            # tmp[..., 0:2] += reference[..., 0:2]
+            # tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
+            # tmp[..., 4:5] += reference[..., 2:3]
+            # tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
+            tmp = tmp.clone()  # 避免破坏计算图
+            tmp[..., 0:2] = (tmp[..., 0:2] + reference[..., 0:2]).sigmoid()
+            tmp[..., 4:5] = (tmp[..., 4:5] + reference[..., 2:3]).sigmoid()
 
             # last level
             if lvl == outs_dec.shape[0] - 1:
-                last_reference_points = torch.cat((tmp[..., 0:2], tmp[..., 4:5]), dim=-1)
+                last_reference_points = torch.cat((tmp[..., 0:2], tmp[..., 4:5]), dim=-1)#
 
-            outputs_coord = tmp
+            outputs_coord = tmp #我们有这个
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
 
         all_cls_scores = torch.stack(outputs_classes)
         all_bbox_preds = torch.stack(outputs_coords)
-
-        all_bbox_preds[..., 0:1] = (all_bbox_preds[..., 0:1] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0])
-        all_bbox_preds[..., 1:2] = (all_bbox_preds[..., 1:2] * (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1])
-        all_bbox_preds[..., 4:5] = (all_bbox_preds[..., 4:5] * (self.pc_range[5] - self.pc_range[2]) + self.pc_range[2])
+        #暂时不管这几个，假设他们是相同的把#这几个神秘参数哪里来的，这里如果拿去运算就会报错！
+        # all_bbox_preds[..., 0:1] = (all_bbox_preds[..., 0:1] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0])
+        # all_bbox_preds[..., 1:2] = (all_bbox_preds[..., 1:2] * (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1])
+        # all_bbox_preds[..., 4:5] = (all_bbox_preds[..., 4:5] * (self.pc_range[5] - self.pc_range[2]) + self.pc_range[2])
 
         # record the query features for the next frame
         # pick the results from the last decoder
-        last_query_feats = outs_dec[-1]
+        last_query_feats = outs_dec[-1] #这个只能全局维护了
 
         outs = {
             'all_cls_scores': all_cls_scores,
-            'all_bbox_preds': all_bbox_preds,
+            'all_bbox_preds': all_bbox_preds,#我们有的是这个
             'enc_cls_scores': None,
             'enc_bbox_preds': None, 
-            'query_feats': last_query_feats,
+            'query_feats': last_query_feats, #这两个靠外部生成
             'reference_points': last_reference_points
         }
         return outs
@@ -409,7 +412,7 @@ class PETRCamTrackingHead(AnchorFreeHead):
             preds_dicts (tuple[list[dict]]): Prediction results.
             img_metas (list[dict]): Point cloud and image's meta info.
         Returns:
-            list[dict]: Decoded bbox, scores and labels after nms.
+            list[dict]: Decoded bbox, scores and labels after nms.#还需要做NMS
         """
         preds_dicts = self.bbox_coder.decode(preds_dicts)
         num_samples = len(preds_dicts)

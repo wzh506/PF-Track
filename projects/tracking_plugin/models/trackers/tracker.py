@@ -18,10 +18,10 @@ from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
 from projects.mmdet3d_plugin.models.dense_heads.petr_head import pos2posemb3d
 from projects.tracking_plugin.core.instances import Instances
 from .runtime_tracker import RunTimeTracker
-from .spatial_temporal_reason import SpatialTemporalReasoner
+from .spatial_temporal_reason import SpatialTemporalReasoner, BoxDecoder
 from .utils import time_position_embedding, xyz_ego_transformation, normalize, denormalize
-
-
+from mmdet.models.utils.transformer import inverse_sigmoid
+#使用了这个装饰器，参数可以通过dict
 @DETECTORS.register_module()
 class Cam3DTracker(MVXTwoStageDetector):
     def __init__(self,
@@ -34,6 +34,7 @@ class Cam3DTracker(MVXTwoStageDetector):
                  motion_prediction_ref_update=True,
                  pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
                  position_range=[-61.2, -61.2, -10.0, 61.2, 61.2, 10.0],
+                 bbox_query=None,
                  spatial_temporal_reason=None,
                  runtime_tracker=None,
                  loss=None,
@@ -73,6 +74,7 @@ class Cam3DTracker(MVXTwoStageDetector):
 
         # spatial-temporal reasoning
         self.STReasoner = SpatialTemporalReasoner(**spatial_temporal_reason)
+        self.bbox_query = BoxDecoder(**bbox_query)
         self.hist_len = self.STReasoner.hist_len
         self.fut_len = self.STReasoner.fut_len
 
@@ -321,22 +323,24 @@ class Cam3DTracker(MVXTwoStageDetector):
         Returns:
             dict: Losses of different branches.
         """
+        # 把这里封装为两块，一块是检测，一块是跟踪
+        
         batch_size, num_frame, num_cam = img.shape[0], img.shape[1], img.shape[2]
 
         # Image features, one clip at a time for checkpoint usages
-        img_feats = self.extract_clip_imgs_feats(img_metas=img_metas, img=img)
+        img_feats = self.extract_clip_imgs_feats(img_metas=img_metas, img=img)#为啥要metas?
 
         # transform labels to a temporal frame-first sense
         ff_gt_bboxes_list, ff_gt_labels_list, ff_instance_ids = list(), list(), list()
         for i in range(num_frame):
             ff_gt_bboxes_list.append([gt_bboxes_3d[j][i] for j in range(batch_size)])
             ff_gt_labels_list.append([gt_labels_3d[j][i] for j in range(batch_size)])
-            ff_instance_ids.append([instance_inds[j][i] for j in range(batch_size)])
+            ff_instance_ids.append([instance_inds[j][i] for j in range(batch_size)])#也是gt似乎
         
         # Empty the runtime_tracker
         # Use PETR head to decode the bounding boxes on every frame
         outs = list()
-        next_frame_track_instances = self.generate_empty_instance()
+        next_frame_track_instances = self.generate_empty_instance()#500个空的query,ini as embeddings
         img_metas_keys = img_metas[0].keys()
 
         # Running over all the frames one by one
@@ -347,29 +351,48 @@ class Cam3DTracker(MVXTwoStageDetector):
                 img_metas_single_sample = {key: img_metas[batch_idx][key][frame_idx] for key in img_metas_keys}
                 img_metas_single_frame.append(img_metas_single_sample)
             
-            # PETR detection head
-            track_instances = next_frame_track_instances
+            # PETR detection head,使用500个空的bbox和t-3的来预测t-2的
+            track_instances = next_frame_track_instances#不断迭代！500-
+            # 就这里这一
+            ######################################################################################
+            #这里以后直接替换为显示的输入即可,注意：track_instances是数量可变的，总是：500+N
             out = self.pts_bbox_head(img_feats[frame_idx], img_metas_single_frame, 
                                      track_instances.query_feats, track_instances.query_embeds, 
-                                     track_instances.reference_points)
-
+                                     track_instances.reference_points) #这一个模型需要更改为sparse4D
+            #输出的out数量也是可变的
+            ######################################################################################
+            #显式输入调整的代码
+            # 方法1：query_feats 要么通过bbox_query获得（这个逻辑的来源是）
+            # out['query_feats'] = self.bbox_query(out['all_cls_scores'][-1])#torch.Size([1, 500, 10]) -> torch.Size([1, 500, 256])
+            # 方法2：通过融合bbox和 query_feat获得#torch.Size([1, 500, 256])
+            query_feats = self.bbox_query(out['all_bbox_preds'][-1].squeeze(),track_instances.query_feats.clone())
+            out['query_feats'] = query_feats.unsqueeze(0)
+            #是否需要使用pc.range调整？这个self.pc_range是点云的归一化距离，需要调整
+            # out['all_bbox_preds'][-1][..., 0:1] = (out['all_bbox_preds'][-1][..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
+            # out['all_bbox_preds'][-1][..., 1:2] = (out['all_bbox_preds'][-1][..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
+            # out['all_bbox_preds'][-1][..., 2:3] = (out['all_bbox_preds'][-1][..., 2:3] - self.pc_range[2]) / (self.pc_range[5] - self.pc_range[2])
+            
+            out['reference_points'] = torch.cat((out['all_bbox_preds'][-1][...,0:2],out['all_bbox_preds'][-1][...,4:5]),dim=-1)
+            ####################################################################################
+            # track_instances跟着输入进去
+            # 这里out其实就是bbox和logits,还有query_feats和query_embeds
             # 1. Record the information into the track instances cache
             track_instances = self.load_detection_output_into_cache(track_instances, out)
-            out['track_instances'] = track_instances
-            out['points'] = points[0][frame_idx]
-
+            out['track_instances'] = track_instances #
+            out['points'] = points[0][frame_idx] #难道是激光雷达的点云？按照list[batch][frame]的形式
+            
             # 2. Loss computation for the detection
             out['loss_dict'] = self.criterion.loss_single_frame(frame_idx, 
                                                                 ff_gt_bboxes_list[frame_idx],
                                                                 ff_gt_labels_list[frame_idx],
-                                                                ff_instance_ids[frame_idx],
+                                                                ff_instance_ids[frame_idx],#id应该都还没有赋值呢
                                                                 out,
                                                                 None)
 
             # 3. Spatial-temporal reasoning
-            track_instances = self.STReasoner(track_instances)
-
-            if self.STReasoner.history_reasoning:
+            track_instances = self.STReasoner(track_instances)#500个,做了什么交互
+            #使用._fields.keys()可以看到有哪些字段
+            if self.STReasoner.history_reasoning: #这里看不明白
                 out['loss_dict'] = self.criterion.loss_mem_bank(frame_idx,
                                                                 out['loss_dict'],
                                                                 ff_gt_bboxes_list[frame_idx],
@@ -503,7 +526,8 @@ class Cam3DTracker(MVXTwoStageDetector):
                       rescale=False,
                       **kwargs):
         batch_size, num_frame, num_cam = img.shape[0], img.shape[1], img.shape[2]
-        
+        # forward track中 b,f ==1
+        # 以后就不需要了
         # backbone images
         img_feats = self.extract_clip_imgs_feats(img_metas=img_metas, img=img)
         
@@ -523,7 +547,7 @@ class Cam3DTracker(MVXTwoStageDetector):
                     contents = deepcopy(img_metas[i][key][0])
             img_metas_single_sample[key] = contents
             all_img_metas.append(img_metas_single_sample)
-        
+        # track使用时和训练时有点点不同
         # new sequence
         if self.runtime_tracker.timestamp is None or abs(timestamp[0] - self.runtime_tracker.timestamp) > 10:
             self.runtime_tracker.timestamp = timestamp[0]
@@ -564,16 +588,29 @@ class Cam3DTracker(MVXTwoStageDetector):
             self.runtime_tracker.timestamp = timestamp[0]
 
             # 2. PETR detection head
+            ############################# 这里同上
             out = self.pts_bbox_head(img_feats[frame_idx], img_metas_single_frame, 
                                      track_instances.query_feats, track_instances.query_embeds, 
                                      track_instances.reference_points)
-
+            ######################################
+                        #显式输入调整的代码
+            # 方法1：query_feats 要么通过bbox_query获得（这个逻辑的来源是）
+            # out['query_feats'] = self.bbox_query(out['all_cls_scores'][-1])#torch.Size([1, 500, 10]) -> torch.Size([1, 500, 256])
+            # 方法2：通过融合bbox和 query_feat获得
+            out['query_feats'] = self.bbox_query(out['all_bbox_preds'][-1].squeeze(),track_instances.query_feats)
+            #是否需要使用pc.range调整？这个self.pc_range是点云的归一化距离，需要调整
+            out['all_bbox_preds'][-1][..., 0:1] = (out['all_bbox_preds'][-1][..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
+            out['all_bbox_preds'][-1][..., 1:2] = (out['all_bbox_preds'][-1][..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
+            out['all_bbox_preds'][-1][..., 2:3] = (out['all_bbox_preds'][-1][..., 2:3] - self.pc_range[2]) / (self.pc_range[5] - self.pc_range[2])
+            
+            out['reference_points'] = torch.cat((out['all_bbox_preds'][-1][...,0:2],out['all_bbox_preds'][-1][...,4:5]),dim=-1)
+            
             # 3. Record the information into the track instances cache
             track_instances = self.load_detection_output_into_cache(track_instances, out)
             out['track_instances'] = track_instances
 
             # 4. Spatial-temporal Reasoning
-            self.STReasoner(track_instances)
+            track_instances = self.STReasoner(track_instances) #很奇异为什么原版没有赋值（相当于没用）
             track_instances = self.frame_summarization(track_instances, tracking=True)
             out['all_cls_scores'][-1][0, :] = track_instances.logits
             out['all_bbox_preds'][-1][0, :] = track_instances.bboxes
@@ -618,7 +655,7 @@ class Cam3DTracker(MVXTwoStageDetector):
         bbox_results = [
             track_bbox3d2result(bboxes, scores, labels, obj_idxes, track_scores, forecasting)
             for bboxes, scores, labels, obj_idxes, track_scores, forecasting in bbox_list
-        ]
+        ] #表明第几帧对应的是哪个track,(obj_idxes已经转换为track_ids了)
         bbox_results[0]['track_ids'] = [f'{self.runtime_tracker.current_seq}-{i}' for i in bbox_results[0]['track_ids'].long().cpu().numpy().tolist()]
         return bbox_results
     
@@ -728,7 +765,7 @@ class Cam3DTracker(MVXTwoStageDetector):
         """
         # query initialization for detection
         # reference points, mapping fourier encoding to embed_dims
-        self.reference_points = nn.Embedding(self.num_query, 3)
+        self.reference_points = nn.Embedding(self.num_query, 3)#可学习的变量
         self.query_embedding = nn.Sequential(
             nn.Linear(self.embed_dims*3//2, self.embed_dims),
             nn.ReLU(),
